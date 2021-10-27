@@ -1,0 +1,102 @@
+---
+title: "COVID-19 project"
+author: Zian ZHUANG
+output:
+  html_document:
+    highlight: pygments
+    toc: yes
+    toc_float: yes
+---
+
+<!-- Setup -->
+<style type="text/css">
+body{ /* Normal  */
+      font-size: 17px;
+      font-family: "Times New Roman";
+  }
+h1,h2,h3,h4,h5,h6{
+  font-family: "Times New Roman";
+}
+</style>
+
+```{r echo=FALSE, message=FALSE}
+knitr::opts_chunk$set(fig.align = 'center', message = FALSE)
+library(knitr)
+library(readxl)
+library(ggplot2)
+library(Surrogate)
+library(tidyverse)
+```
+<!-- Begin writing -->
+
+## 1. Number check
+
+I have already check the spreadsheet. All numbers are correct.
+
+## 2. Find N’s for each permutation
+
+```{r}
+contact_cases <- read_xlsx("contact_cases.xlsx")
+```
+
+### Find observations
+
+```{r}
+contact_cases %>%
+  filter(`case type`=="contact",
+         `variant`=="alpha",
+         `type`=="Total") %>% 
+  select(number) -> num1
+
+contact_cases %>%
+  filter(`case type`=="contact",
+         `variant`=="delta",
+         `type`=="Total") %>% 
+  select(number) -> num2
+
+contact_cases %>%
+  filter(`case type`=="index",
+         `variant`=="alpha",
+         `type`=="Total") %>% 
+  select(number) -> lambda1
+
+contact_cases %>%
+  filter(`case type`=="index",
+         `variant`=="delta",
+         `type`=="Total") %>% 
+  select(number) -> lambda2
+```
+
+### Generate random matrix
+
+```{r}
+df<-lapply(as.list(1:5000),
+           function(x){out <- RandVec(a=0, b=1, s=1, n=5, m=5, Seed=x)
+           return(out$RandVecOutput)})
+```
+
+### Find the mle
+
+```{r}
+cal_likelihood <- function(x){
+  Total_likelihood <- NULL
+  for(i in 1:4){
+    likelihood_temp1 <- log(ppois(sum(num1*x[i,]), as.numeric(lambda1[i,])))
+    likelihood_temp2 <- log(ppois(sum(num2*x[i,]), as.numeric(lambda2[i,])))
+    Total_likelihood <- sum(Total_likelihood, 
+                            likelihood_temp1, 
+                            likelihood_temp2)
+  }
+  return(Total_likelihood)
+}
+
+start_time <- Sys.time()
+ll <- Reduce(rbind, lapply(df, cal_likelihood))
+end_time <- Sys.time()
+end_time - start_time
+
+df[[which.max(ll)]]
+```
+
+
+<div class="tocify-extend-page" data-unique="tocify-extend-page" style="height: 0;"></div>

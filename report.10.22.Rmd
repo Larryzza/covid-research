@@ -1,0 +1,508 @@
+---
+title: "COVID-19 project report 2"
+author: Zian ZHUANG
+output:
+  html_document:
+    highlight: pygments
+    toc: yes
+    toc_float: yes
+---
+
+<!-- Setup -->
+<style type="text/css">
+body{ /* Normal  */
+      font-size: 17px;
+      font-family: "Times New Roman";
+  }
+h1,h2,h3,h4,h5,h6{
+  font-family: "Times New Roman";
+}
+</style>
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(fig.align = 'center', message = FALSE)
+library(msm)
+library(knitr)
+library(readxl)
+library(ggplot2)
+library(parallel)
+library(tidyverse)
+library(kableExtra)
+```
+<!-- Begin writing -->
+
+A method to estimate the N’s for each permutation and corresponding infection probability, based on the results of [David et al.](https://www.medrxiv.org/content/10.1101/2021.09.28.21264260v1)'s paper [(supplementary)](https://www.medrxiv.org/content/10.1101/2021.09.28.21264260v1.supplementary-material).
+
+## 1. Find N’s for each permutation
+
+Firstly we calculated the total contacts number (N) for each permutation.
+
+### Find observations
+
+We extracted total number of alpha/delta contacts from the paper, grouped by index/contact vaccination status.
+
+```{r}
+contact_cases <- read_xlsx("contact_cases.xlsx")
+
+# total alpha contacts, grouped by contacts vaccination status
+(contact_cases %>%
+  filter(`case type`=="contact",
+         `variant`=="alpha",
+         `type`=="Total") %>% 
+  select(number) -> num_alpha_Total)
+
+# total delta contacts, grouped by contacts vaccination status
+(contact_cases %>%
+  filter(`case type`=="contact",
+         `variant`=="delta",
+         `type`=="Total") %>% 
+  select(number) -> num_delta_Total)
+
+# total alpha contacts, grouped by index vaccination status
+(contact_cases %>%
+  filter(`case type`=="index",
+         `variant`=="alpha",
+         `type`=="Total") %>% 
+  select(number) -> lambda_alpha_Total)
+
+# total alpha contacts, grouped by index vaccination status
+(contact_cases %>%
+  filter(`case type`=="index",
+         `variant`=="delta",
+         `type`=="Total") %>% 
+  select(number) -> lambda_delta_Total)
+```
+
+
+Reference table
+![ ](fig.png)
+
+### Generate random matrix
+
+We defined the probabilities of contacting index cases for each permutation (assume the probabilities are **same** in both alpha and delta group). Note that the probabilities are used to calculate **total contact cases** rather than **infected cases** here.
+
+$$
+\text{sum} = 1\left\{
+\begin{aligned}
+P(\text{a (uv) contact meet a index (uv) case}) & = & uv_1 \\
+P(\text{a (uv) contact meet a index (1az) case}) & = & uv_2 \\
+P(\text{a (uv) contact meet a index (1p) case}) & = & uv_3 \\
+P(\text{a (uv) contact meet a index (2az) case}) & = & uv_4 \\
+P(\text{a (uv) contact meet a index (2p) case}) & = & uv_5 
+\end{aligned}
+\right.
+\\
+\text{sum} = 1\left\{
+\begin{aligned}
+P(\text{a (1az) contact meet a index (uv) case}) & = & 1az_1 \\
+P(\text{a (1az) contact meet a index (1az) case}) & = & 1az_2 \\
+P(\text{a (1az) contact meet a index (1p) case}) & = & 1az_3 \\
+P(\text{a (1az) contact meet a index (2az) case}) & = & 1az_4 \\
+P(\text{a (1az) contact meet a index (2p) case}) & = & 1az_5 
+\end{aligned}
+\right.\\
+...\\
+...\\
+...
+$$
+In total, we will have 25 probabilities. Then we can generate 5*5 random matrix to represent it. Each column means the probabilities that a individual in specific vaccination group (e.g. uv) meet a index case in specific vaccination groups (uv, 1az...). And The sum of each column is 1. Here is an example of random matrix.
+
+```{r echo=FALSE}
+set.seed(1996)
+z <- matrix(NA,5,5)
+z[1,] <- runif(5)
+z[2,] <- (1 - z[1,])*runif(5)
+z[3,] <- (1 - colSums(z[1:2,]))*runif(5)
+z[4,] <- (1 - colSums(z[1:3,]))*runif(5)
+z[5,] <- 1 - colSums(z[1:4,])
+z <- apply(z, 2, function(x){
+  x <- x[rank(runif(5),ties.method = "first")]
+  return(x)})
+colnames(z) <- c("uv","1az","1p","2az","2p")
+rownames(z) <- c("uv<-","1az<-","1p<-","2az<-","2p<-")
+z %>% round(.,4) %>%  
+  kbl(caption = "sample probability") %>%
+  add_header_above(c(" ", "contacts" = 5)) %>%
+  pack_rows("index", 1, 5) %>%
+  kable_classic(full_width = F, html_font = "Cambria")
+```
+
+Assume that the observation of total alpha/delta contacts, grouped by contacts vaccination status is correct. Then we can calculate the number of total alpha/delta contacts, grouped by index vaccination status using the probability we have.
+
+Then, assume the cases are poisson distributed with the mean as we observed (e.g. total alpha contacts, whose index vaccination statu is uv, follows $Pois(6175)$), we can use MLE method to estimate the probabilities. 
+
+```{r}
+# function calculate the sum of log likelihood
+.cal_likelihood1 <- function(x){
+  each_likelihood <- apply(x, 1, function(x){
+    ll_temp1 <- dpois(ceiling(sum(num_alpha_Total * x[c(1:5)])),
+                      as.numeric(lambda_alpha_Total[x[7],]), log = T)
+    ll_temp2 <- dpois(ceiling(sum(num_delta_Total * x[c(1:5)])),
+                      as.numeric(lambda_delta_Total[x[7],]), log = T)
+    return(c(ll_temp1, ll_temp2))
+  })
+  return(data.frame(likelihood=sum(each_likelihood), 
+                    location=as.numeric(x[1,6])))
+}
+```
+
+### Find the mle estimates
+
+Here we randomly generate 30000000 candidate matrix to find the matrix which provides highest likelihood. 
+
+```{r, message=FALSE}
+# function generate random matrix which contains 25 probabilities as defined.
+.mat1 <-  function(x){
+  set.seed(x+100000)
+  z <- matrix(NA,5,5)
+  z[1,] <- runif(5)
+  z[2,] <- (1 - z[1,])*runif(5)
+  z[3,] <- (1 - colSums(z[1:2,]))*runif(5)
+  z[4,] <- (1 - colSums(z[1:3,]))*runif(5)
+  z[5,] <- 1 - colSums(z[1:4,])
+  z <- apply(z, 2, function(x){
+    x <- x[rank(runif(5),ties.method = "first")]
+    return(x)
+  })
+  out <- cbind(z, ref_id=x, i=1:5)
+  return(out)}
+```
+
+To reduce the running time, we applied the parallel computing here.
+
+```{r, eval=FALSE}
+start.time <- Sys.time()
+vol <- 10000
+cl.cores <- detectCores(logical = T)
+cl <- makeCluster(cl.cores)
+clusterExport(cl, varlist=c("num_alpha_Total", "lambda_alpha_Total",
+                            ".mat1", ".cal_likelihood1",
+                            "num_delta_Total", "lambda_delta_Total", "vol"),
+              envir=environment())
+ll <- parLapply(cl, as.list(seq(0,30000000,vol)), function(x){
+  df <- lapply(as.list((x+1):(x+vol)), .mat1)
+  ll <- Reduce("rbind", lapply(df, .cal_likelihood1))
+  ll <- ll[which.max(ll$likelihood),]
+  write.csv(ll, paste0(".//sim//n_",x,"_ll.csv"))
+  return(ll)})
+stopCluster(cl)
+end.time <- Sys.time()
+(time.taken <- end.time - start.time)
+
+ll <- ll %>%  bind_rows() 
+write.csv(ll, "ll.csv")
+```
+
+Then we can obtain estimated N’s for each permutation,
+
+```{r echo=FALSE, warning=F}
+ll <- read_csv("ll.csv")
+ll <- ll %>% .[which.max(.$likelihood),]
+mle_value <- lapply(ll$location, .mat1)[[1]][,-c(6,7)]
+colnames(mle_value) <- c("uv","1az","1p","2az","2p")
+rownames(mle_value) <- c("uv<-","1az<-","1p<-","2az<-","2p<-")
+mle_value %>% round(.,4) %>% 
+  kbl(caption = "Probabilities") %>%
+  add_header_above(c(" ", "contacts" = 5)) %>%
+  pack_rows("index", 1, 5) %>%
+  kable_classic(full_width = F, html_font = "Cambria")
+
+# alpha 
+permutation_alpha_n <- NULL
+for(i in 1:5){
+  temp <- ceiling(num_alpha_Total * mle_value[i,]) 
+  permutation_alpha_n <- c(permutation_alpha_n, temp) 
+}
+permutation_alpha_n <- permutation_alpha_n %>% Reduce("rbind",.)
+colnames(permutation_alpha_n) <- c("uv","1az","1p","2az","2p")
+rownames(permutation_alpha_n) <- c("uv<-","1az<-","1p<-","2az<-","2p<-")
+
+permutation_alpha_n %>%
+  kbl(caption = "Alpha cases") %>%
+  add_header_above(c(" ", "contacts" = 5)) %>%
+  pack_rows("index", 1, 5) %>%
+  kable_classic(full_width = F, html_font = "Cambria")
+
+# delta 
+permutation_delta_n <- NULL
+for(i in 1:5){
+  temp <- ceiling(num_delta_Total * mle_value[i,]) 
+  permutation_delta_n <- c(permutation_delta_n, temp) 
+}
+permutation_delta_n <- permutation_delta_n %>% Reduce("rbind",.)
+colnames(permutation_delta_n) <- c("uv","1az","1p","2az","2p")
+rownames(permutation_delta_n) <- c("uv<-","1az<-","1p<-","2az<-","2p<-")
+
+permutation_delta_n %>%
+  kbl(caption = "Delta cases") %>%
+  add_header_above(c(" ", "contacts" = 5)) %>%
+  pack_rows("index", 1, 5) %>%
+  kable_classic(full_width = F, html_font = "Cambria")
+```
+
+## 2. Find corresponding probability of infection.
+
+Then, based on the N's we obtained previously, we can further estimate the infection probability for each permutation.
+
+### Find observations
+
+Firstly, extracted number of infected cases, grouped by index/contacts vaccination status.
+
+```{r}
+# alpha infected contacts, grouped by index vaccination status
+(contact_cases %>%
+  filter(`case type`=="index",
+         `variant`=="alpha",
+         `type`=="infected") %>% 
+  select(number) -> lambda_alpha_infected)
+
+# alpha infected contacts, grouped by contacts vaccination status
+(contact_cases %>%
+  filter(`case type`=="contact",
+         `variant`=="alpha",
+         `type`=="infected") %>% 
+  select(number) -> lambda_alpha_infected_c)
+
+# delta infected contacts, grouped by index vaccination status
+(contact_cases %>%
+  filter(`case type`=="index",
+         `variant`=="delta",
+         `type`=="infected") %>% 
+  select(number) -> lambda_delta_infected)
+
+# delta infected contacts, grouped by contacts vaccination status
+(contact_cases %>%
+  filter(`case type`=="contact",
+         `variant`=="delta",
+         `type`=="infected") %>% 
+  select(number) -> lambda_delta_infected_c)
+```
+
+### Generate random matrix
+
+Define,
+
+$$
+\textbf{For alpha}\\
+\text{a (uv) contact}\left\{
+\begin{aligned}
+P(\text{infected by a alpha index (uv) case}) & = & Auv_1 \\
+P(\text{infected by a alpha index (1az) case}) & = & Auv_2 \\
+P(\text{infected by a alpha index (1p) case}) & = & Auv_3 \\
+P(\text{infected by a alpha index (2az) case}) & = & Auv_4 \\
+P(\text{infected by a alpha index (2p) case}) & = & Auv_5 
+\end{aligned}
+\right.
+\\
+\text{a (1az) contact}\left\{
+\begin{aligned}
+P(\text{infected by a alpha index (uv) case}) & = & A1az_1 \\
+P(\text{infected by a alpha index (1az) case}) & = & A1az_2 \\
+P(\text{infected by a alpha index (1p) case}) & = & A1az_3 \\
+P(\text{infected by a alpha index (2az) case}) & = & A1az_4 \\
+P(\text{infected by a alpha index (2p) case}) & = & A1az_5 
+\end{aligned}
+\right.\\
+...\\
+...\\
+...\\
+\textbf{For delta}\\
+\text{a (uv) contact}\left\{
+\begin{aligned}
+P(\text{infected by a delta index (uv) case}) & = & Duv_1 \\
+P(\text{infected by a delta index (1az) case}) & = & Duv_2 \\
+P(\text{infected by a delta index (1p) case}) & = & Duv_3 \\
+P(\text{infected by a delta index (2az) case}) & = & Duv_4 \\
+P(\text{infected by a delta index (2p) case}) & = & Duv_5 
+\end{aligned}
+\right.\\
+...\\
+...\\
+...
+$$
+Then we have 25 probabilities for alpha cases and 25 probabilities for delta cases. Assuming that infected cases are poisson distributed and have a mean value as observed, we estimated the infection probability separately.
+
+We generated 5*5 random matrix to represent the probabilities. We used normal distribution to generate each probability in this step. We set the observation prob as the mean of normal distribution(e.g. 0.49 for a (uv) contact). Standard deviations are set as mean/2.
+
+```{r}
+# function generate random matrix for infection probability
+.mat2 <-  function(x){
+  set.seed(x+10000)
+  z <- matrix(c(rtnorm(5, 0.49, 0.49/2, lower=0, upper=1),
+                rtnorm(5, 0.33, 0.33/2, lower=0, upper=1),
+                rtnorm(5, 0.32, 0.32/2, lower=0, upper=1),
+                rtnorm(5, 0.23, 0.23/2, lower=0, upper=1),
+                rtnorm(5, 0.17, 0.17/2, lower=0, upper=1)),5,5)
+  out <- cbind(z, ref_id=x)
+  return(out)}
+```
+
+Note that the estimated infection probabilities for alpha and delta groups here may be different with each other. In other words, alpha and delta groups will have different probability matrix respectively.
+
+```{r, message=FALSE}
+# function calculate sum of log likelihood for alpha
+.cal_likelihood2 <- function(x){
+  temp_alpha <- permutation_alpha_n * x [,c(1:5)]
+  ll_temp1 <- sum(dpois(ceiling(rowSums(temp_alpha)),
+                        unlist(lambda_alpha_infected), log = T)) 
+  ll_temp2 <- sum(dpois(ceiling(colSums(temp_alpha)),
+                        unlist(lambda_alpha_infected_c), log = T))
+  return(data.frame(likelihood2=sum(ll_temp1, ll_temp2),
+                    location2=x[1,6]))
+}
+
+# function calculate sum of log likelihood for delta
+.cal_likelihood3 <- function(x){
+  temp_delta <- permutation_alpha_n * x [,c(1:5)]
+  ll_temp3 <- sum(dpois(ceiling(rowSums(temp_delta)),
+                        unlist(lambda_delta_infected), log = T))
+  ll_temp4 <- sum(dpois(ceiling(colSums(temp_delta)),
+                        unlist(lambda_delta_infected_c), log = T))
+  return(data.frame(likelihood3=sum(ll_temp3, ll_temp4),
+                    location3=x[1,6]))
+}
+```
+
+Then we use bootstrap quantile to estimate the parameters' CI.
+
+```{r}
+#function calculate CI
+.find_ci <- function(values){
+  ci_matrix_l <- matrix(NA,5,5)
+  ci_matrix_u <- matrix(NA,5,5)
+  for(i in 1:5){
+    for(z in 1:5){
+      ci_temp <- lapply(values,function(x){
+        out<-round(x[i,z]*100, 2)
+        return(out)
+        }) %>% Reduce("c",.)
+      ci_matrix_l[i,z] <- min(ci_temp)
+      ci_matrix_u[i,z] <- max(ci_temp)
+    }
+  }
+  return(list(ci_matrix_l,ci_matrix_u))
+}
+```
+
+### Find the mle estimates
+
+Here we randomly generated 50000000 candidate matrix to find the matrix which provides highest likelihood for alpha and delta group separately. To reduce the running time, we applied the parallel computing here. 
+
+```{r,message=FALSE,warning=FALSE, eval=FALSE}
+start.time <- Sys.time()
+vol <- 10000
+cl.cores <- detectCores(logical = T)
+cl <- makeCluster(cl.cores)
+clusterExport(cl, varlist=c("lambda_alpha_infected", "lambda_alpha_infected_c",
+                            "lambda_delta_infected", "lambda_delta_infected_c",
+                            "permutation_alpha_n", "permutation_delta_n",
+                            "mle_value", ".mat2", ".cal_likelihood2",
+                            ".cal_likelihood3", "vol"),
+              envir=environment())
+clusterEvalQ(cl, library(msm))
+ll_total <- parLapply(cl, as.list(seq(0,50000000,vol)), function(x){
+  df <- lapply(as.list((x+1):(x+vol)), .mat2)
+  ll2 <- Reduce("rbind", lapply(df, .cal_likelihood2))
+  ll2 <- ll2[which.max(ll2$likelihood2),]
+  ll3 <- Reduce("rbind", lapply(df, .cal_likelihood3))
+  ll3 <- ll3[which.max(ll3$likelihood3),]
+  ll_total <- data.frame(ll2, ll3)
+  write.csv(ll_total, paste0(".//sim//infect_",x,"_ll.csv"))
+  return(ll_total)})
+stopCluster(cl)
+end.time <- Sys.time()
+(time.taken <- end.time - start.time)
+
+ll_total <- ll_total %>% bind_rows()
+write.csv(ll_total, "ll_total.csv")
+```
+
+Then we obtained estimated infection probabilities and CI for each permutation,
+
+```{r echo=FALSE, warning=F}
+ll_total <- read_csv("ll_total.csv")
+#alpha
+mle_value2 <- lapply(ll_total$location2[which.max(ll_total$likelihood2)],
+                     .mat2)[[1]][,-c(6,7)]
+lb <- quantile(ll_total$likelihood2, c(0.025,0.975))[1]
+ub <- quantile(ll_total$likelihood2, c(0.025,0.975))[2]
+ind <- ll_total$location2[which(ll_total$likelihood2<=ub &
+                                  ll_total$likelihood2>=lb)] 
+values <- lapply(as.list(ind), .mat2)
+ci_matrix <- .find_ci(values)
+
+prob_alpha <- round(mle_value2[,1:5]*100,2) 
+prob_alpha <- paste0(prob_alpha, "(",ci_matrix[[1]],", ",ci_matrix[[2]],")")
+prob_alpha <- matrix(prob_alpha, 5,5)
+colnames(prob_alpha) <- c("uv","1az","1p","2az","2p")
+rownames(prob_alpha) <- c("uv->","1az->","1p->","2az->","2p->")
+prob_alpha %>% 
+  kbl(caption = "Alpha infection prob (%)") %>%
+  add_header_above(c(" ", "contacts" = 5)) %>%
+  pack_rows("index", 1, 5) %>%
+  kable_classic(full_width = T, html_font = "Cambria")
+
+infected_cases <- (permutation_alpha_n * mle_value2[,1:5]) %>% ceiling
+infected_cases_u <- (permutation_alpha_n * ci_matrix[[2]] / 100) %>% ceiling
+infected_cases_l <- (permutation_alpha_n * ci_matrix[[1]] / 100) %>% ceiling
+infected_cases <- paste0(infected_cases, "(",infected_cases_l,
+                         ", ",infected_cases_u,")")
+infected_cases <- matrix(infected_cases,5,5)
+colnames(infected_cases) <- c("uv","1az","1p","2az","2p")
+rownames(infected_cases) <- c("uv->","1az->","1p->","2az->","2p->")
+infected_cases %>% 
+  kbl(caption = "Alpha cases") %>%
+  add_header_above(c(" ", "contacts" = 5)) %>%
+  pack_rows("index", 1, 5) %>%
+  kable_classic(full_width = F, html_font = "Cambria")
+
+
+#delta
+mle_value3 <- lapply(ll_total$location3[which.max(ll_total$likelihood3)],
+                     .mat2)[[1]][,-c(6,7)]
+lb <- quantile(ll_total$likelihood3, c(0.025,0.975))[1]
+ub <- quantile(ll_total$likelihood3, c(0.025,0.975))[2]
+ind <- ll_total$location3[which(ll_total$likelihood3<=ub &
+                                  ll_total$likelihood3>=lb)] 
+values <- lapply(as.list(ind), .mat2)
+ci_matrix <- .find_ci(values)
+
+prob_alpha <- round(mle_value3[,1:5]*100,2)
+prob_alpha <- paste0(prob_alpha, "(",ci_matrix[[1]],", ",ci_matrix[[2]],")")
+prob_alpha <- matrix(prob_alpha, 5,5)
+colnames(prob_alpha) <- c("uv","1az","1p","2az","2p")
+rownames(prob_alpha) <- c("uv->","1az->","1p->","2az->","2p->")
+prob_alpha %>% 
+  kbl(caption = "Delta infection prob (%)") %>%
+  add_header_above(c(" ", "contacts" = 5)) %>%
+  pack_rows("index", 1, 5) %>%
+  kable_classic(full_width = F, html_font = "Cambria")
+
+infected_cases <- (permutation_alpha_n * mle_value3[,1:5]) %>% ceiling
+infected_cases_u <- (permutation_alpha_n * ci_matrix[[2]] / 100) %>% ceiling
+infected_cases_l <- (permutation_alpha_n * ci_matrix[[1]] / 100) %>% ceiling
+infected_cases <- paste0(infected_cases, "(",infected_cases_l,
+                         ", ",infected_cases_u,")")
+infected_cases <- matrix(infected_cases,5,5)
+colnames(infected_cases) <- c("uv","1az","1p","2az","2p")
+rownames(infected_cases) <- c("uv->","1az->","1p->","2az->","2p->")
+infected_cases %>% 
+  kbl(caption = "Delta cases") %>%
+  add_header_above(c(" ", "contacts" = 5)) %>%
+  pack_rows("index", 1, 5) %>%
+  kable_classic(full_width = F, html_font = "Cambria")
+```
+
+## 3.Findings
+
+1) Some permutations in alpha and delta groups are estimated to have very few cases (N<5), which may affect the infection probability estimation. As a consequence, some estimated infection probabilities' CI are very wide.
+
+2) Note that the uv->uv in delta group has a very low estimated infection rate (5.09%(1.04%, 9.87%)), which means that only a small number of people are regarded as infected through uv->uv. This result seems unreasonable. I presume that it might be one of the reason that the results in [David et al.](https://www.medrxiv.org/content/10.1101/2021.09.28.21264260v1)'s paper looks weird.
+
+## 4.Limitation
+
+1) Made many assumptions (e.g. when calculate N’s for each permutation, assumed the probabilities are same in both alpha and delta group).
+
+2) Did not consider the uncertainty of N’s for each permutation when estimating infection probabilities.
+
+<div class="tocify-extend-page" data-unique="tocify-extend-page" style="height: 0;"></div>
